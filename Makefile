@@ -10,6 +10,7 @@ ICONDIR   ?= $(DATADIR)/icons/hicolor/scalable/apps
 SCRIPTS   = scripts/pdanet
 GUI       = src/pdanet-gui.py
 DESKTOP   = system/pdanet-gui.desktop
+DISPATCHER = system/99-pdanet-proxy
 ICON      = icons/pdanet-linux.svg
 
 .PHONY: all install uninstall install-user deb arch pkg
@@ -21,6 +22,7 @@ install:
 	install -Dm755 $(SCRIPTS)  $(DESTDIR)$(BINDIR)/pdanet
 	install -Dm755 $(GUI)      $(DESTDIR)$(BINDIR)/pdanet-gui
 	install -Dm644 $(DESKTOP)  $(DESTDIR)$(APPDIR)/pdanet-gui.desktop
+	install -Dm755 $(DISPATCHER) $(DESTDIR)/etc/NetworkManager/dispatcher.d/99-pdanet-proxy
 	@if [ -f "$(ICON)" ]; then \
 		install -Dm644 $(ICON) $(DESTDIR)$(ICONDIR)/pdanet-linux.svg; \
 	fi

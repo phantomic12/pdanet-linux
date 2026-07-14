@@ -1,0 +1,71 @@
+#!/bin/bash
+# PDANet proxy — ephemeral: only active while connected to the PDANet hotspot.
+# Called by NetworkManager on interface up/down events.
+
+IFACE="$1"
+ACTION="$2"
+
+[[ "$IFACE" =~ ^wlan ]] || exit 0
+
+PROXY_HOST="192.168.49.1"
+PROXY_PORT="8000"
+PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}"
+NO_PROXY="localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,100.64.0.0/10,.ts.net"
+
+REAL_USER=$(logname 2>/dev/null || echo "${SUDO_USER:-}")
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+REAL_UID=$(id -u "$REAL_USER")
+[[ -n "$REAL_USER" && -n "$REAL_HOME" ]] || exit 0
+
+USER_ENV_FILE="$REAL_HOME/.config/environment.d/pdanet.conf"
+DBUS_ADDR="unix:path=/run/user/$REAL_UID/bus"
+
+_run_as_user() {
+    # NM dispatchers run as root with no stdin — sudo -S would hang/blow up.
+    # runuser needs no password when called from root.
+    runuser -u "$REAL_USER" -- env "DBUS_SESSION_BUS_ADDRESS=$DBUS_ADDR" "$@"
+}
+
+proxy_on() {
+    mkdir -p "$(dirname "$USER_ENV_FILE")"
+    cat > "$USER_ENV_FILE" <<'PROXYEOF'
+http_proxy=http://192.168.49.1:8000
+https_proxy=http://192.168.49.1:8000
+ftp_proxy=http://192.168.49.1:8000
+all_proxy=http://192.168.49.1:8000
+no_proxy=localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,100.64.0.0/10,.ts.net
+HTTP_PROXY=http://192.168.49.1:8000
+HTTPS_PROXY=http://192.168.49.1:8000
+FTP_PROXY=http://192.168.49.1:8000
+ALL_PROXY=http://192.168.49.1:8000
+NO_PROXY=localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,100.64.0.0/10,.ts.net
+PROXYEOF
+    chown "$REAL_USER:$REAL_USER" "$(dirname "$USER_ENV_FILE")" "$USER_ENV_FILE" 2>/dev/null
+
+    _run_as_user gsettings set org.gnome.system.proxy mode 'manual' 2>/dev/null || true
+    _run_as_user gsettings set org.gnome.system.proxy.http host "$PROXY_HOST" 2>/dev/null || true
+    _run_as_user gsettings set org.gnome.system.proxy.http port "$PROXY_PORT" 2>/dev/null || true
+    _run_as_user gsettings set org.gnome.system.proxy.https host "$PROXY_HOST" 2>/dev/null || true
+    _run_as_user gsettings set org.gnome.system.proxy.https port "$PROXY_PORT" 2>/dev/null || true
+}
+
+proxy_off() {
+    rm -f "$USER_ENV_FILE"
+    _run_as_user gsettings set org.gnome.system.proxy mode 'none' 2>/dev/null || true
+}
+
+check_pdanet_ssid() {
+    local ssid
+    ssid=$(nmcli -t -f NAME,DEVICE,TYPE connection show --active 2>/dev/null \
+        | awk -F: -v dev="$IFACE" '$2==dev && $3=="802-11-wireless" {print $1; exit}')
+    [[ "$ssid" == *PdaNet* || "$ssid" == *PDANet* ]]
+}
+
+case "$ACTION" in
+    up|dhcp4-change|dhcp6-change|connectivity-change)
+        if check_pdanet_ssid; then proxy_on; else proxy_off; fi
+        ;;
+    down|pre-down)
+        proxy_off
+        ;;
+esac
