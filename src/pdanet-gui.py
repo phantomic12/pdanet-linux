@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -31,7 +32,12 @@ from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 APP_ID = "io.github.pdanetlinux.PDAnet"
 APP_NAME = "PDAnet-linux"
-SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "pdanet"
+# Prefer the installed helper (PATH), fall back to sibling for source-tree runs
+_HELPER = shutil.which("pdanet")
+if _HELPER:
+    SCRIPT = Path(_HELPER)
+else:
+    SCRIPT = Path(__file__).resolve().parent / "pdanet"
 USER_ENV_FILE = Path.home() / ".config" / "environment.d" / "pdanet.conf"
 PROFILE_SH = Path("/etc/profile.d/pdanet.sh")
 
