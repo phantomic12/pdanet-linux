@@ -25,7 +25,9 @@ jobs:
         run: python3 -m py_compile src/pdanet-gui.py
 
       - name: Check desktop file
-        run: desktop-file-validate system/pdanet-gui.desktop
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq desktop-file-utils
+          desktop-file-validate system/pdanet-gui.desktop
 
   # ---------- build Arch package ----------
   build-arch:
@@ -42,10 +44,10 @@ jobs:
         run: |
           pacman -S --noconfirm bash curl networkmanager python python-gobject gtk4 libadwaita
 
-      - name: Build package (makepkg -s)
+      - name: Build package (makepkg)
         run: |
           chown -R nobody: .
-          runuser -u nobody -- makepkg -sf --noconfirm --nocheck
+          runuser -u nobody -- makepkg -ef --nodeps --noconfirm
         env:
           PKGEXT: .pkg.tar.zst
 
@@ -69,11 +71,14 @@ jobs:
       - name: Build .deb
         run: dpkg-buildpackage -us -uc -b
 
+      - name: Collect .deb into workspace
+        run: mv ../*.deb .
+
       - name: Upload .deb
         uses: actions/upload-artifact@v4
         with:
           name: deb-package
-          path: ../*.deb
+          path: "*.deb"
 
   # ---------- release artifacts ----------
   release:

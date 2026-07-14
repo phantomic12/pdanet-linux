@@ -13,11 +13,11 @@ makedepends=('git')
 optdepends=('polkit: for system-wide proxy configuration via pkexec')
 provides=('pdanet-linux')
 conflicts=('pdanet-linux-git')
-source=("$pkgname-$pkgver.tar.gz::https://github.com/phantomic12/pdanet-linux/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+source=()
+sha256sums=()
 
 package() {
-    cd "$srcdir/$pkgname-$pkgver"
+    cd "$startdir"
 
     # CLI
     install -Dm755 scripts/pdanet                "$pkgdir/usr/bin/pdanet"
