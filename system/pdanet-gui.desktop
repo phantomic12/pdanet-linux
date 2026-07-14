@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=PDAnet-linux
+GenericName=Internet Sharing
+Comment=Use your phone's cellular link through the PDA Net WiFi Direct Hotspot
+Exec=/home/yoav/projects/pdanet-linux/src/pdanet-gui.py
+Icon=network-wireless-symbolic
+Terminal=false
+Categories=Network;Telephony;
+Keywords=proxy;tethering;hotspot;pda;cellular;
+StartupNotify=true
+StartupWMClass=PDAnet-linux

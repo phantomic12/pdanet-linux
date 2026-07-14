@@ -1,0 +1,24 @@
+# Packaging artifacts
+*.pkg.tar.zst
+*.deb
+*.rpm
+pkg/
+*.tar.gz
+*.tar.xz
+
+# Build directories
+dist/
+build/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

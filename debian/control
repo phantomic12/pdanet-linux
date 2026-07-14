@@ -1,0 +1,30 @@
+Source: pdanet-linux
+Section: net
+Priority: optional
+Maintainer: pdanet-linux contributors <https://github.com/phantomic12/pdanet-linux>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/phantomic12/pdanet-linux
+Rules-Requires-Root: no
+
+Package: pdanet-linux
+Architecture: all
+Depends: ${misc:Depends},
+         bash,
+         curl,
+         network-manager,
+         python3,
+         python3-gi,
+         gir1.2-gtk-4.0,
+         gir1.2-adw-1
+Recommends: pkexec | policykit-1
+Description: Linux client for PDA Net WiFi Direct Hotspot
+ PDAnet-linux shares your phone's cellular data connection
+ with a Linux machine by managing the HTTP proxy that PDA Net's
+ "WiFi Direct Hotspot" mode exposes on the phone.
+ .
+ Includes:
+  - pdanet CLI: on/off/status/test/watch commands
+  - pdanet-gui: libadwaita GUI with live traffic monitor and speed test
+ .
+ Supports bash, zsh, fish, tcsh, ksh, and dash out of the box.

@@ -1,0 +1,19 @@
+#!/usr/bin/make -f
+# debian/rules — pdanet-linux
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# nothing to compile
+
+override_dh_auto_install:
+	# use our own install logic
+	install -Dm755 scripts/pdanet       debian/pdanet-linux/usr/bin/pdanet
+	install -Dm755 src/pdanet-gui.py    debian/pdanet-linux/usr/bin/pdanet-gui
+	install -Dm644 system/pdanet-gui.desktop \
+	                                    debian/pdanet-linux/usr/share/applications/pdanet-gui.desktop
+	if [ -f icons/pdanet-linux.svg ]; then \
+		install -Dm644 icons/pdanet-linux.svg \
+			debian/pdanet-linux/usr/share/icons/hicolor/scalable/apps/pdanet-linux.svg; \
+	fi

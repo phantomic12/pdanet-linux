@@ -1,0 +1,7 @@
+pdanet-linux (1.0.0-1) unstable; urgency=medium
+
+  * Initial release.
+  * Support bash, zsh, fish, tcsh, ksh shell configs.
+  * Includes CLI (pdanet) and libadwaita GUI (pdanet-gui).
+
+ -- pdanet-linux contributors <https://github.com/phantomic12/pdanet-linux>  Mon, 13 Jul 2026 00:00:00 +0000

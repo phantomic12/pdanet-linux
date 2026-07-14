@@ -1,0 +1,509 @@
+#!/usr/bin/env bash
+# PDAnet-linux — connect Linux to the internet through a PDA Net "WiFi Direct Hotspot"
+#
+# PDA Net's WiFi Direct Hotspot is NOT a NAT hotspot. The phone hands out DHCP
+# and answers pings, but it does NOT forward arbitrary traffic. Instead it runs
+# a local HTTP proxy on port 8000 that tunnels traffic over the phone's
+# cellular connection. This script finds that proxy and exports it so the rest
+# of the system can use it.
+#
+# Usage:
+#     pdanet on        Connect + set proxy env vars
+#     pdanet off       Unset proxy env vars
+#     pdanet status    Show current state
+#     pdanet test      Verify proxy works (curl ipinfo.io)
+#     pdanet watch     Foreground: auto-toggle on SSID association
+#
+# Files written:
+#     /etc/profile.d/pdanet.sh                  login shells (all POSIX)
+#     ~/.config/environment.d/pdanet.conf       systemd user env (GUI apps)
+#     ~/.bashrc                                 bash interactive non-login
+#     ~/.zshrc                                  zsh interactive
+#     ~/.config/fish/config.fish                fish interactive
+#     ~/.tcshrc                                 tcsh/csh interactive
+#     ~/.kshrc                                  ksh interactive non-login
+set -euo pipefail
+
+SSID="DIRECT-01-motorola edg-PdaNet"
+PROXY_PORT=8000
+PROFILE_SH="/etc/profile.d/pdanet.sh"
+USER_ENV_DIR="$HOME/.config/environment.d"
+USER_ENV_FILE="$USER_ENV_DIR/pdanet.conf"
+BASHRC="$HOME/.bashrc"
+ZSHRC="$HOME/.zshrc"
+FISH_CONFIG="$HOME/.config/fish/config.fish"
+TCSHRC="$HOME/.tcshrc"
+KSHRC="$HOME/.kshrc"
+
+# ---------- helpers ----------
+log()  { printf '\033[1;36m[pdanet]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[pdanet]\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31m[pdanet]\033[0m %s\n' "$*" >&2; }
+ok()   { printf '\033[1;32m[pdanet]\033[0m %s\n' "$*"; }
+
+need_root() {
+    # If the parent already set PDANET_ORIG_USER, we ARE the re-exec'd
+    # child — don't recurse. The main dispatcher will route us to the
+    # system-side function and exit.
+    if [[ -n "${PDANET_ORIG_USER:-}" ]]; then
+        return 0
+    fi
+    if [[ $EUID -ne 0 ]]; then
+        warn "this action needs root — re-running with pkexec (polkit prompt)"
+        # Preserve the original user's HOME so the re-exec'd instance
+        # can find the user env file and so gsettings etc. target the
+        # right account. We pass it through env, then re-derive it in
+        # the re-exec child.
+        local orig_user orig_home
+        orig_user="${SUDO_USER:-$(logname 2>/dev/null || echo "$USER")}"
+        # Resolve UID back to a username for pkexec
+        if [[ "$orig_user" =~ ^[0-9]+$ ]]; then
+            orig_user="$(getent passwd "$orig_user" | cut -d: -f1)"
+        fi
+        orig_home="$(getent passwd "$orig_user" | cut -d: -f6)"
+        if [[ -z "$orig_home" ]]; then orig_home="$HOME"; fi
+        # pkexec runs the program as root (no --user). The re-exec
+        # instance is detected via PDANET_ORIG_USER + runs as root,
+        # which lets it write /etc/profile.d directly. HOME is passed
+        # through env so the child knows where the user env file lives.
+        exec pkexec env "HOME=$orig_home" \
+            "PDANET_ORIG_USER=$orig_user" \
+            "PDANET_ORIG_HOME=$orig_home" \
+            "$(readlink -f "$0")" "$@"
+    fi
+}
+
+# Find the IP of the phone's wlan0-side gateway (the PDA Net proxy host)
+# by looking for an active WiFi connection whose SSID is PDA Net.
+find_phone_ip() {
+    local ssid active_if gateway
+    active_if=$(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null \
+        | awk -F: '$2=="wifi" && $3 ~ /^connected/ {print $1; exit}')
+    if [[ -z "$active_if" ]]; then
+        err "no active WiFi connection"
+        return 1
+    fi
+    ssid=$(nmcli -t -f NAME,DEVICE,TYPE connection show --active 2>/dev/null \
+        | awk -F: -v d="$active_if" '$2==d {print $1; exit}')
+    if [[ "$ssid" != *PdaNet* ]]; then
+        err "active WiFi SSID is '$ssid' — not a PDA Net hotspot"
+        return 1
+    fi
+    gateway=$(ip route | awk -v d="$active_if" '$0 ~ "default" && $0 ~ d {print $3; exit}')
+    if [[ -z "$gateway" ]]; then
+        err "no default route on $active_if"
+        return 1
+    fi
+    echo "$gateway"
+}
+
+verify_proxy() {
+    local ip="$1"
+    if ! timeout 2 bash -c "echo > /dev/tcp/$ip/$PROXY_PORT" 2>/dev/null; then
+        err "phone at $ip is reachable but port $PROXY_PORT is closed"
+        err "(is PDA Net's 'WiFi Direct Hotspot' enabled on the phone?)"
+        return 1
+    fi
+    local code
+    code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' \
+                -x "http://$ip:$PROXY_PORT" https://ipinfo.io/json || echo "000")
+    if [[ "$code" != "200" ]]; then
+        err "proxy responded HTTP $code — phone has no internet?"
+        return 1
+    fi
+    local wan_ip
+    wan_ip=$(curl -sS -m 5 -x "http://$ip:$PROXY_PORT" https://ipinfo.io/ip)
+    ok "proxy OK — phone's WAN IP: $wan_ip"
+}
+
+# ---------- commands ----------
+cmd_status() {
+    local active ssid
+    ssid=$(nmcli -t -f NAME,DEVICE,TYPE connection show --active 2>/dev/null \
+           | awk -F: '$3=="802-11-wireless" {print $1; exit}')
+    if [[ "$ssid" == *PdaNet* ]]; then
+        echo "WiFi:    connected to '$ssid'"
+        local ip
+        ip=$(find_phone_ip 2>/dev/null || echo "?")
+        echo "Gateway: $ip"
+    else
+        echo "WiFi:    not on PDA Net (current SSID: ${ssid:-none})"
+    fi
+    if [[ -n "${http_proxy:-}" ]]; then
+        echo "Proxy:   $http_proxy (in env)"
+    elif [[ -f "$USER_ENV_FILE" ]]; then
+        echo "Proxy:   $(grep http_proxy "$USER_ENV_FILE" | head -1 | cut -d= -f2-) (systemd user env)"
+    elif [[ -f "$PROFILE_SH" ]]; then
+        echo "Proxy:   $(grep http_proxy "$PROFILE_SH" | head -1) (profile.d)"
+    else
+        echo "Proxy:   not set"
+    fi
+}
+
+cmd_test() {
+    local ip
+    ip=$(find_phone_ip) || exit 1
+    verify_proxy "$ip"
+    echo ""
+    log "speed test (1 MB download via proxy):"
+    curl -sS -m 15 -o /dev/null -w "  http=%{http_code}  time=%{time_total}s  bytes=%{size_download}\n" \
+        -x "http://$ip:$PROXY_PORT" \
+        http://speed.cloudflare.com/__down?bytes=1000000
+}
+
+cmd_on() {
+    local ip
+    ip=$(find_phone_ip) || exit 1
+    log "PDA Net gateway: $ip"
+    verify_proxy "$ip" || exit 1
+    local proxy_url="http://$ip:$PROXY_PORT"
+    local no_proxy="localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,100.64.0.0/10,.ts.net"
+
+    # 1. user-side: systemd user env + gsettings (no root needed,
+    #    and we want these to land in the calling user's dconf,
+    #    not root's)
+    mkdir -p "$USER_ENV_DIR"
+    cat > "$USER_ENV_FILE" <<EOF
+http_proxy=$proxy_url
+https_proxy=$proxy_url
+ftp_proxy=$proxy_url
+all_proxy=$proxy_url
+no_proxy=$no_proxy
+EOF
+    ok "wrote $USER_ENV_FILE"
+
+    # also append a marker to ~/.bashrc so interactive non-login
+    # shells (the most common case when you open a terminal) pick
+    # up the proxy. The user's bashrc typically starts with
+    #   [[ $- != *i* ]] && return
+    # which short-circuits when sourced non-interactively, so we
+    # place the PDANET block at the very top of the file (before
+    # that guard) using a sentinel that avoids re-appending.
+    if [[ -f "$BASHRC" ]] && grep -q "PDANET_BEGIN" "$BASHRC" 2>/dev/null; then
+        sed -i '/PDANET_BEGIN/,/PDANET_END/d' "$BASHRC"
+    fi
+    # Build the block as a temporary file, then prepend
+    pdanet_block=$(mktemp)
+    cat > "$pdanet_block" <<EOF
+# PDANET_BEGIN — managed by the pdanet script; do not edit
+if [[ -z "\${__PDANET_LOADED:-}" ]]; then
+    export __PDANET_LOADED=1
+    export http_proxy="$proxy_url"
+    export https_proxy="$proxy_url"
+    export ftp_proxy="$proxy_url"
+    export all_proxy="$proxy_url"
+    export no_proxy="$no_proxy"
+    export HTTP_PROXY="$proxy_url"
+    export HTTPS_PROXY="$proxy_url"
+    export FTP_PROXY="$proxy_url"
+    export ALL_PROXY="$proxy_url"
+    export NO_PROXY="$no_proxy"
+fi
+# PDANET_END
+
+EOF
+    if [[ -f "$BASHRC" ]]; then
+        cat "$pdanet_block" "$BASHRC" > "$BASHRC.tmp"
+        mv "$BASHRC.tmp" "$BASHRC"
+    else
+        # create a minimal bashrc
+        mkdir -p "$(dirname "$BASHRC")"
+        cat "$pdanet_block" > "$BASHRC"
+    fi
+    rm -f "$pdanet_block"
+    ok "prepended proxy block to $BASHRC"
+
+    # fish config — append a managed block (fish processes config.fish
+    # top-to-bottom, so appending is correct; later set-gx overrides)
+    if [[ -f "$FISH_CONFIG" ]]; then
+        sed -i '/^# PDANET_BEGIN/,/^# PDANET_END/d' "$FISH_CONFIG"
+    fi
+    cat >> "$FISH_CONFIG" <<EOF
+# PDANET_BEGIN — managed by the pdanet script; do not edit
+set -gx http_proxy "$proxy_url"
+set -gx https_proxy "$proxy_url"
+set -gx HTTP_PROXY "$proxy_url"
+set -gx HTTPS_PROXY "$proxy_url"
+set -gx no_proxy "$no_proxy"
+set -gx NO_PROXY "$no_proxy"
+# PDANET_END
+EOF
+    ok "appended proxy block to $FISH_CONFIG"
+
+    # zsh config — same sentinel-based prepend as bash
+    if [[ -f "$ZSHRC" ]] && grep -q "PDANET_BEGIN" "$ZSHRC" 2>/dev/null; then
+        sed -i '/PDANET_BEGIN/,/PDANET_END/d' "$ZSHRC"
+    fi
+    zsh_block=$(mktemp)
+    cat > "$zsh_block" <<EOF
+# PDANET_BEGIN — managed by the pdanet script; do not edit
+if [[ -z "\${__PDANET_LOADED:-}" ]]; then
+    export __PDANET_LOADED=1
+    export http_proxy="$proxy_url"
+    export https_proxy="$proxy_url"
+    export ftp_proxy="$proxy_url"
+    export all_proxy="$proxy_url"
+    export no_proxy="$no_proxy"
+    export HTTP_PROXY="$proxy_url"
+    export HTTPS_PROXY="$proxy_url"
+    export FTP_PROXY="$proxy_url"
+    export ALL_PROXY="$proxy_url"
+    export NO_PROXY="$no_proxy"
+fi
+# PDANET_END
+
+EOF
+    if [[ -f "$ZSHRC" ]]; then
+        cat "$zsh_block" "$ZSHRC" > "$ZSHRC.tmp"
+        mv "$ZSHRC.tmp" "$ZSHRC"
+    else
+        mkdir -p "$(dirname "$ZSHRC")"
+        cat "$zsh_block" > "$ZSHRC"
+    fi
+    rm -f "$zsh_block"
+    ok "prepended proxy block to $ZSHRC"
+
+    # tcsh/csh config — append a managed block (uses setenv instead of export)
+    if [[ -f "$TCSHRC" ]]; then
+        sed -i '/^# PDANET_BEGIN/,/^# PDANET_END/d' "$TCSHRC"
+    fi
+    cat >> "$TCSHRC" <<EOF
+# PDANET_BEGIN — managed by the pdanet script; do not edit
+setenv http_proxy "$proxy_url"
+setenv https_proxy "$proxy_url"
+setenv HTTP_PROXY "$proxy_url"
+setenv HTTPS_PROXY "$proxy_url"
+setenv no_proxy "$no_proxy"
+setenv NO_PROXY "$no_proxy"
+# PDANET_END
+EOF
+    ok "appended proxy block to $TCSHRC"
+
+    # ksh config — same sentinel-based prepend as bash/zsh
+    if [[ -f "$KSHRC" ]] && grep -q "PDANET_BEGIN" "$KSHRC" 2>/dev/null; then
+        sed -i '/PDANET_BEGIN/,/PDANET_END/d' "$KSHRC"
+    fi
+    ksh_block=$(mktemp)
+    cat > "$ksh_block" <<EOF
+# PDANET_BEGIN — managed by the pdanet script; do not edit
+if [[ -z "\${__PDANET_LOADED:-}" ]]; then
+    export __PDANET_LOADED=1
+    export http_proxy="$proxy_url"
+    export https_proxy="$proxy_url"
+    export ftp_proxy="$proxy_url"
+    export all_proxy="$proxy_url"
+    export no_proxy="$no_proxy"
+    export HTTP_PROXY="$proxy_url"
+    export HTTPS_PROXY="$proxy_url"
+    export FTP_PROXY="$proxy_url"
+    export ALL_PROXY="$proxy_url"
+    export NO_PROXY="$no_proxy"
+fi
+# PDANET_END
+
+EOF
+    if [[ -f "$KSHRC" ]]; then
+        cat "$ksh_block" "$KSHRC" > "$KSHRC.tmp"
+        mv "$KSHRC.tmp" "$KSHRC"
+    else
+        mkdir -p "$(dirname "$KSHRC")"
+        cat "$ksh_block" > "$KSHRC"
+    fi
+    rm -f "$ksh_block"
+    ok "prepended proxy block to $KSHRC"
+
+    if command -v gsettings >/dev/null 2>&1; then
+        gsettings set org.gnome.system.proxy mode 'manual' 2>/dev/null \
+            && ok "set GNOME system proxy" \
+            || warn "could not set GNOME system proxy (dconf not writable?)"
+        gsettings set org.gnome.system.proxy.http host "$ip" 2>/dev/null || true
+        gsettings set org.gnome.system.proxy.http port "$PROXY_PORT" 2>/dev/null || true
+        gsettings set org.gnome.system.proxy.https host "$ip" 2>/dev/null || true
+        gsettings set org.gnome.system.proxy.https port "$PROXY_PORT" 2>/dev/null || true
+    fi
+
+    # spawn the GUI if requested (do it here, before escalating, so it
+    # only fires once — the pkexec re-exec would otherwise spawn it again)
+    if [[ "${1:-}" == "--with-gui" ]]; then
+        if command -v pdanet-gui >/dev/null 2>&1; then
+            nohup pdanet-gui >/dev/null 2>&1 &
+        elif [[ -x "/home/yoav/projects/pdanet-linux/src/pdanet-gui.py" ]]; then
+            nohup python3 /home/yoav/projects/pdanet-linux/src/pdanet-gui.py >/dev/null 2>&1 &
+        fi
+    fi
+
+    # 2. system-wide: /etc/profile.d. We're already past user-side work.
+    # need_root re-execs via pkexec; the re-exec'd instance routes through
+    # the main dispatcher guard above and exits. If we reach here with
+    # EUID==0, something weird happened — write the file directly.
+    if [[ $EUID -ne 0 ]]; then
+        need_root on
+        # If need_root returns, the pkexec re-exec failed.
+        err "system file step did not complete (auth cancelled?)"
+        exit 1
+    fi
+    cat > "$PROFILE_SH" <<EOF
+# Generated by pdanet — points the system at the PDA Net HTTP proxy
+export http_proxy="$proxy_url"
+export https_proxy="$proxy_url"
+export ftp_proxy="$proxy_url"
+export all_proxy="$proxy_url"
+export no_proxy="$no_proxy"
+export HTTP_PROXY="$proxy_url"
+export HTTPS_PROXY="$proxy_url"
+export FTP_PROXY="$proxy_url"
+export ALL_PROXY="$proxy_url"
+export NO_PROXY="$no_proxy"
+EOF
+    chmod 644 "$PROFILE_SH"
+    ok "wrote $PROFILE_SH"
+
+    # 3. current shell (in case we're being sourced)
+    export http_proxy="$proxy_url"
+    export https_proxy="$proxy_url"
+    export ftp_proxy="$proxy_url"
+    export all_proxy="$proxy_url"
+    export no_proxy="$no_proxy"
+    export HTTP_PROXY="$proxy_url" HTTPS_PROXY="$proxy_url"
+    export FTP_PROXY="$proxy_url" ALL_PROXY="$proxy_url" NO_PROXY="$no_proxy"
+
+    ok "PDA Net proxy is ON — new terminals and GUI apps will use it"
+    ok "logout/login to apply GNOME proxy to already-running GUI apps"
+}
+
+# run only the system-file part, used by the pkexec re-exec path
+exec_cmd_on_root() {
+    local proxy_url="$1" no_proxy="$2"
+    cat > "$PROFILE_SH" <<EOF
+# Generated by pdanet — points the system at the PDA Net HTTP proxy
+export http_proxy="$proxy_url"
+export https_proxy="$proxy_url"
+export ftp_proxy="$proxy_url"
+export all_proxy="$proxy_url"
+export no_proxy="$no_proxy"
+export HTTP_PROXY="$proxy_url"
+export HTTPS_PROXY="$proxy_url"
+export FTP_PROXY="$proxy_url"
+export ALL_PROXY="$proxy_url"
+export NO_PROXY="$no_proxy"
+EOF
+    chmod 644 "$PROFILE_SH"
+    ok "wrote $PROFILE_SH (system-wide)"
+}
+
+cmd_off() {
+    # 1. user-side first (no root)
+    rm -f "$USER_ENV_FILE" 2>/dev/null && ok "removed $USER_ENV_FILE" || true
+    if [[ -f "$BASHRC" ]] && grep -q "PDANET_BEGIN" "$BASHRC" 2>/dev/null; then
+        sed -i '/PDANET_BEGIN/,/PDANET_END/d' "$BASHRC"
+        ok "removed proxy block from $BASHRC"
+    fi
+    if [[ -f "$FISH_CONFIG" ]] && grep -q "PDANET_BEGIN" "$FISH_CONFIG" 2>/dev/null; then
+        sed -i '/^# PDANET_BEGIN/,/^# PDANET_END/d' "$FISH_CONFIG"
+        ok "removed proxy block from $FISH_CONFIG"
+    fi
+    if [[ -f "$ZSHRC" ]] && grep -q "PDANET_BEGIN" "$ZSHRC" 2>/dev/null; then
+        sed -i '/PDANET_BEGIN/,/PDANET_END/d' "$ZSHRC"
+        ok "removed proxy block from $ZSHRC"
+    fi
+    if [[ -f "$TCSHRC" ]] && grep -q "PDANET_BEGIN" "$TCSHRC" 2>/dev/null; then
+        sed -i '/^# PDANET_BEGIN/,/^# PDANET_END/d' "$TCSHRC"
+        ok "removed proxy block from $TCSHRC"
+    fi
+    if [[ -f "$KSHRC" ]] && grep -q "PDANET_BEGIN" "$KSHRC" 2>/dev/null; then
+        sed -i '/PDANET_BEGIN/,/PDANET_END/d' "$KSHRC"
+        ok "removed proxy block from $KSHRC"
+    fi
+    if command -v gsettings >/dev/null 2>&1; then
+        gsettings set org.gnome.system.proxy mode 'none' 2>/dev/null \
+            && ok "unset GNOME system proxy" \
+            || warn "could not unset GNOME system proxy"
+    fi
+
+    # 2. system file (/etc/profile.d/pdanet.sh). need_root re-execs;
+    # the re-exec'd instance routes through the main dispatcher guard
+    # and exits. If we reach here, the re-exec failed.
+    if [[ $EUID -ne 0 ]]; then
+        need_root off
+        err "system file step did not complete (auth cancelled?)"
+        exit 1
+    fi
+    rm -f "$PROFILE_SH" 2>/dev/null && ok "removed $PROFILE_SH" || true
+    unset http_proxy https_proxy ftp_proxy all_proxy no_proxy
+    unset HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY
+    ok "PDA Net proxy is OFF"
+}
+
+# system-side part of cmd_off, used by the pkexec re-exec path
+exec_cmd_off_root() {
+    rm -f "$PROFILE_SH" 2>/dev/null && ok "removed $PROFILE_SH (system-wide)" || true
+}
+
+cmd_watch() {
+    log "watching for SSID '$SSID' association…"
+    # Watch NetworkManager for connect/disconnect events on the PDA Net SSID
+    nmcli monitor 2>/dev/null | while read -r line; do
+        if [[ "$line" == *"PdaNet"* ]]; then
+            if [[ "$line" == *connected* ]]; then
+                log "PDA Net appeared — turning proxy ON"
+                cmd_on || true
+            elif [[ "$line" == *disconnected* || "$line" == *deactivated* ]]; then
+                log "PDA Net disappeared — turning proxy OFF"
+                cmd_off || true
+            fi
+        fi
+    done
+}
+
+# ---------- main ----------
+# Detect re-exec from need_root. The re-exec'd instance must ONLY do the
+# system-side work and exit — never recurse into cmd_on/cmd_off.
+if [[ -n "${PDANET_ORIG_USER:-}" ]]; then
+    case "${1:-}" in
+        on)
+            # User-side already happened in the parent. Re-derive everything
+            # needed and write the system file. We recover the proxy URL
+            # from the user env file the parent wrote.
+            if [[ -f "$USER_ENV_FILE" ]]; then
+                proxy_url=$(grep '^http_proxy=' "$USER_ENV_FILE" | head -1 | cut -d= -f2-)
+                no_proxy=$(grep '^no_proxy=' "$USER_ENV_FILE" | head -1 | cut -d= -f2-)
+                if [[ -n "$proxy_url" ]]; then
+                    exec_cmd_on_root "$proxy_url" "$no_proxy"
+                    ok "PDA Net proxy is ON — new terminals and GUI apps will use it"
+                    exit 0
+                fi
+            fi
+            err "re-exec: could not recover proxy URL from $USER_ENV_FILE"
+            exit 1
+            ;;
+        off)
+            exec_cmd_off_root
+            ok "PDA Net proxy is OFF"
+            exit 0
+            ;;
+    esac
+fi
+
+case "${1:-}" in
+    on)        shift; cmd_on "$@" ;;
+    off)       cmd_off ;;
+    status)    cmd_status ;;
+    test)      cmd_test ;;
+    watch)     cmd_watch ;;
+    -h|--help|help|"")
+        cat <<EOF
+pdanet — share PDA Net's cellular link with Linux
+
+  pdanet on [(--with-gui)]  enable proxy
+  pdanet off                disable proxy
+  pdanet status             show state
+  pdanet test               verify the proxy is reachable and works
+  pdanet watch              foreground watcher (auto on/off on SSID events)
+
+PDA Net's WiFi Direct Hotspot is not a NAT hotspot — it only exposes an HTTP
+proxy on port 8000 of the gateway it advertises. This script finds that
+gateway and points the system at it.
+EOF
+        ;;
+    *) err "unknown command: $1 (try 'pdanet help')"; exit 2 ;;
+esac
