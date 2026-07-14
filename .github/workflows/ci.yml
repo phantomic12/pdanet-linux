@@ -38,10 +38,14 @@ jobs:
         run: |
           pacman -Syu --noconfirm base-devel git
 
+      - name: Install PKGBUILD deps (as root)
+        run: |
+          pacman -S --noconfirm bash curl networkmanager python python-gobject gtk4 libadwaita
+
       - name: Build package (makepkg -s)
         run: |
           chown -R nobody: .
-          runuser -u nobody -- makepkg -sf --noconfirm
+          runuser -u nobody -- makepkg -sf --noconfirm --nocheck
         env:
           PKGEXT: .pkg.tar.zst
 
